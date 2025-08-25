@@ -1,0 +1,26 @@
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: hf-token
+type: Opaque
+data:
+  HF_TOKEN: aGZfem9XbnR3VU1CVE53VGZmQXVPWVJIWWVKWUVJcGhDYmZ3Yw==
+---
+apiVersion: kaito.sh/v1beta1
+kind: Workspace
+metadata:
+  name: workspace-llama-3-1-8b-instruct
+resource:
+  preferredNodes:
+    - aks-a10pool-13804173-vmss000000
+    # - aks-a100pool-30379952-vmss000000
+    # - aks-h100pool-10497385-vmss000000
+  labelSelector:
+    matchLabels:
+      apps: guidellm
+inference:
+  preset:
+    name: llama-3.1-8b-instruct
+    presetOptions:
+      modelAccessSecret: hf-token

@@ -1,0 +1,40 @@
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: hf-token
+type: Opaque
+data:
+  HF_TOKEN: aGZfem9XbnR3VU1CVE53VGZmQXVPWVJIWWVKWUVJcGhDYmZ3Yw==
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: distributed-inference-config
+data:
+  inference_config.yaml: |
+    vllm:
+      gpu-memory-utilization: 0.95
+      max-model-len: 50000
+---
+apiVersion: kaito.sh/v1beta1
+kind: Workspace
+metadata:
+  name: workspace-llama-3-3-70b-instruct
+resource:
+  count: 2
+  instanceType: Standard_NC48ads_A100_v4
+  # instanceType: Standard_NC40ads_H100_v5
+  preferredNodes:
+    - aks-a100pool48-34116683-vmss000000
+    - aks-a100pool48-34116683-vmss000001
+    # - aks-h100pool-10497385-vmss000000
+  labelSelector:
+    matchLabels:
+      apps: vllm
+inference:
+  preset:
+    name: llama-3.3-70b-instruct
+    presetOptions:
+      modelAccessSecret: hf-token
+  config: "distributed-inference-config"
