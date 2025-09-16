@@ -16,6 +16,7 @@ package v1beta1
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
@@ -24,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	"github.com/kaito-project/kaito/pkg/featuregates"
 	"github.com/kaito-project/kaito/pkg/k8sclient"
 	"github.com/kaito-project/kaito/pkg/model"
 	"github.com/kaito-project/kaito/pkg/utils/consts"
@@ -244,6 +246,23 @@ vllm:
 
 func TestResourceSpecValidateCreate(t *testing.T) {
 	RegisterValidationTestModels()
+
+	// Set up feature gate for NAP enabled (these tests assume NAP is enabled)
+	originalFeatureGate := featuregates.FeatureGates[consts.FeatureFlagDisableNodeAutoProvisioning]
+	originalCloudProvider := os.Getenv("CLOUD_PROVIDER")
+	defer func() {
+		featuregates.FeatureGates[consts.FeatureFlagDisableNodeAutoProvisioning] = originalFeatureGate
+		if originalCloudProvider == "" {
+			os.Unsetenv("CLOUD_PROVIDER")
+		} else {
+			os.Setenv("CLOUD_PROVIDER", originalCloudProvider)
+		}
+	}()
+
+	// Enable NAP for these tests
+	featuregates.FeatureGates[consts.FeatureFlagDisableNodeAutoProvisioning] = false
+	os.Setenv("CLOUD_PROVIDER", "azure")
+
 	tests := []struct {
 		name                    string
 		resourceSpec            *ResourceSpec
@@ -326,7 +345,7 @@ func TestResourceSpecValidateCreate(t *testing.T) {
 				Count:        pointerToInt(1),
 			},
 			runtime:        model.RuntimeNameVLLM,
-			errContent:     "Unsupported instance",
+			errContent:     "is unsupported with node auto-provisioning",
 			expectErrs:     true,
 			validateTuning: false,
 		},
@@ -468,7 +487,7 @@ func TestResourceSpecValidateCreate(t *testing.T) {
 				totalSafeTensorFileSize = tc.totalSafeTensorFileSize
 				perGPUMemoryRequirement = tc.modelPerGPUMemory
 
-				errs := tc.resourceSpec.validateCreateWithInference(&spec, false, tc.runtime)
+				errs := tc.resourceSpec.validateCreateWithInference(context.Background(), &spec, false, tc.runtime)
 				hasErrs := errs != nil
 				if hasErrs != tc.expectErrs {
 					t.Errorf("validateCreate() errors = %v, expectErrs %v", errs, tc.expectErrs)
@@ -1122,6 +1141,15 @@ func TestWorkspaceValidateCreate(t *testing.T) {
 
 func TestWorkspaceValidateName(t *testing.T) {
 	RegisterValidationTestModels()
+
+	// Set up feature gate for NAP enabled (this test assumes NAP is enabled)
+	originalFeatureGate := featuregates.FeatureGates[consts.FeatureFlagDisableNodeAutoProvisioning]
+	defer func() {
+		featuregates.FeatureGates[consts.FeatureFlagDisableNodeAutoProvisioning] = originalFeatureGate
+	}()
+
+	// Enable NAP for this test
+	featuregates.FeatureGates[consts.FeatureFlagDisableNodeAutoProvisioning] = false
 
 	// Set environment variables
 	t.Setenv("CLOUD_PROVIDER", consts.AzureCloudName)
@@ -2035,6 +2063,249 @@ other_field: value
 				errMsg := errs.Error()
 				if !strings.Contains(errMsg, tc.errContent) {
 					t.Errorf("validateInferenceConfig() error message = %v, expected to contain = %v", errMsg, tc.errContent)
+				}
+			}
+		})
+	}
+}
+
+func TestResourceSpecValidateCreateWithInference_NAPDisabled(t *testing.T) {
+	RegisterValidationTestModels()
+	originalFeatureGate := featuregates.FeatureGates[consts.FeatureFlagDisableNodeAutoProvisioning]
+	defer func() {
+		featuregates.FeatureGates[consts.FeatureFlagDisableNodeAutoProvisioning] = originalFeatureGate
+	}()
+
+	// Enable NAP disabled feature gate
+	featuregates.FeatureGates[consts.FeatureFlagDisableNodeAutoProvisioning] = true
+
+	// Set up fake client with mock nodes that have nvidia.com labels
+	scheme := runtime.NewScheme()
+	_ = v1.AddToScheme(scheme)
+	client := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(
+		// Mock node for the test
+		&v1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "test-node-1",
+				Labels: map[string]string{
+					"nvidia.com/gpu.count":  "1",
+					"nvidia.com/gpu.memory": "24576", // 24GB in MB
+				},
+			},
+		},
+	).Build()
+	k8sclient.SetGlobalClient(client)
+
+	tests := []struct {
+		name           string
+		resourceSpec   ResourceSpec
+		inferenceSpec  InferenceSpec
+		expectErrs     bool
+		errContent     string
+	}{
+		{
+			name: "Should error when instanceType is specified with NAP disabled",
+			resourceSpec: ResourceSpec{
+				InstanceType: "Standard_NC24ads_A100_v4",
+				LabelSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						"node.kubernetes.io/instance-type": "Standard_NC24ads_A100_v4",
+					},
+				},
+				PreferredNodes: []string{"test-node-1"},
+			},
+			inferenceSpec: InferenceSpec{
+				// No preset - test without preset validation first
+			},
+			expectErrs: true,
+			errContent: "Instance type should not be specified when NAP is disabled",
+		},
+		{
+			name: "Should validate successfully when NAP is disabled and no instanceType specified",
+			resourceSpec: ResourceSpec{
+				LabelSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						"nvidia.com/gpu.count":  "1",
+						"nvidia.com/gpu.memory": "24576", // 24GB in MB
+					},
+				},
+				PreferredNodes: []string{"test-node-1"},
+			},
+			inferenceSpec: InferenceSpec{
+				// No preset to avoid preset validation issues
+			},
+			expectErrs: false,
+		},
+		{
+			name: "Should show readable error message for insufficient GPU memory when NAP is disabled",
+			resourceSpec: ResourceSpec{
+				LabelSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						"nvidia.com/gpu.count":  "1",
+						"nvidia.com/gpu.memory": "24576", // 24GB in MB, insufficient for llama-3.3-70b
+					},
+				},
+				PreferredNodes: []string{"test-node-1"},
+			},
+			inferenceSpec: InferenceSpec{
+				Preset: &PresetSpec{
+					PresetMeta: PresetMeta{
+						Name: ModelName("test-validation"), // This will have high memory requirement from our mock
+					},
+				},
+			},
+			expectErrs: true,
+			errContent: " Gi", // Should show memory in GiB format with space
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Mock the model preset for testing - set before validation
+			originalGPUCount := gpuCountRequirement
+			originalTensorSize := totalSafeTensorFileSize
+			defer func() {
+				gpuCountRequirement = originalGPUCount
+				totalSafeTensorFileSize = originalTensorSize
+			}()
+
+			// Set different requirements based on test case
+			if strings.Contains(tc.name, "insufficient GPU memory") {
+				gpuCountRequirement = "1"
+				totalSafeTensorFileSize = "130Gi" // Require more than 24GB available
+			} else {
+				gpuCountRequirement = "1"
+				totalSafeTensorFileSize = "13.44Gi" // Small requirement
+			}
+
+			errs := tc.resourceSpec.validateCreateWithInference(context.Background(), &tc.inferenceSpec, false, "")
+			hasErrs := errs != nil
+
+			if hasErrs != tc.expectErrs {
+				t.Errorf("validateCreateWithInference() errors = %v, expectErrs %v", errs, tc.expectErrs)
+			}
+
+			if hasErrs && tc.errContent != "" {
+				errMsg := errs.Error()
+				if !strings.Contains(errMsg, tc.errContent) {
+					t.Errorf("validateCreateWithInference() error message = %v, expected to contain = %v", errMsg, tc.errContent)
+				}
+			}
+		})
+	}
+}
+
+func TestResourceSpecValidateCreateWithInference_NAPEnabled(t *testing.T) {
+	RegisterValidationTestModels()
+	originalFeatureGate := featuregates.FeatureGates[consts.FeatureFlagDisableNodeAutoProvisioning]
+	originalCloudProvider := os.Getenv("CLOUD_PROVIDER")
+	defer func() {
+		featuregates.FeatureGates[consts.FeatureFlagDisableNodeAutoProvisioning] = originalFeatureGate
+		if originalCloudProvider == "" {
+			os.Unsetenv("CLOUD_PROVIDER")
+		} else {
+			os.Setenv("CLOUD_PROVIDER", originalCloudProvider)
+		}
+	}()
+
+	// Ensure NAP is enabled (disabled feature gate = false)
+	featuregates.FeatureGates[consts.FeatureFlagDisableNodeAutoProvisioning] = false
+	// Set cloud provider for SKU validation
+	os.Setenv("CLOUD_PROVIDER", "azure")
+
+	tests := []struct {
+		name           string
+		resourceSpec   ResourceSpec
+		inferenceSpec  InferenceSpec
+		expectErrs     bool
+		errContent     string
+	}{
+		{
+			name: "Should error when instanceType is not specified with NAP enabled",
+			resourceSpec: ResourceSpec{
+				// No InstanceType specified
+				LabelSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						"node.kubernetes.io/instance-type": "Standard_NC24ads_A100_v4",
+					},
+				},
+				Count: pointerToInt(1),
+			},
+			inferenceSpec: InferenceSpec{
+				// No preset to avoid preset validation issues
+			},
+			expectErrs: true,
+			errContent: "Instance type is required when node auto-provisioning is enabled",
+		},
+		{
+			name: "Should validate successfully when instanceType is specified with NAP enabled",
+			resourceSpec: ResourceSpec{
+				InstanceType: "Standard_NC24ads_A100_v4",
+				LabelSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						"node.kubernetes.io/instance-type": "Standard_NC24ads_A100_v4",
+					},
+				},
+				Count: pointerToInt(1),
+			},
+			inferenceSpec: InferenceSpec{
+				// No preset to avoid preset validation issues
+			},
+			expectErrs: false,
+		},
+		{
+			name: "Should show readable error message for insufficient GPU memory when NAP is enabled",
+			resourceSpec: ResourceSpec{
+				InstanceType: "Standard_NC24ads_A100_v4", // Standard A100 with 80GB each
+				LabelSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						"node.kubernetes.io/instance-type": "Standard_NC24ads_A100_v4",
+					},
+				},
+				Count: pointerToInt(1),
+			},
+			inferenceSpec: InferenceSpec{
+				Preset: &PresetSpec{
+					PresetMeta: PresetMeta{
+						Name: ModelName("test-validation"), // This will have high memory requirement from our mock
+					},
+				},
+			},
+			expectErrs: true,
+			errContent: " Gi", // Should show memory in GiB format with space
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Mock the model preset for testing - set before validation
+			originalGPUCount := gpuCountRequirement
+			originalTensorSize := totalSafeTensorFileSize
+			defer func() {
+				gpuCountRequirement = originalGPUCount
+				totalSafeTensorFileSize = originalTensorSize
+			}()
+
+			// Set different requirements based on test case
+			if strings.Contains(tc.name, "insufficient GPU memory") {
+				gpuCountRequirement = "1"
+				totalSafeTensorFileSize = "130Gi" // Require more than 80GB available from Standard A100
+			} else {
+				gpuCountRequirement = "1"
+				totalSafeTensorFileSize = "13.44Gi" // Small requirement
+			}
+
+			errs := tc.resourceSpec.validateCreateWithInference(context.Background(), &tc.inferenceSpec, false, "")
+			hasErrs := errs != nil
+
+			if hasErrs != tc.expectErrs {
+				t.Errorf("validateCreateWithInference() errors = %v, expectErrs %v", errs, tc.expectErrs)
+			}
+
+			if hasErrs && tc.errContent != "" {
+				errMsg := errs.Error()
+				if !strings.Contains(errMsg, tc.errContent) {
+					t.Errorf("validateCreateWithInference() error message = %v, expected to contain = %v", errMsg, tc.errContent)
 				}
 			}
 		})
