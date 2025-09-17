@@ -28,6 +28,8 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+
+	"github.com/kaito-project/kaito/pkg/featuregates"
 	"k8s.io/utils/ptr"
 
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
@@ -37,6 +39,32 @@ import (
 	"github.com/kaito-project/kaito/pkg/utils/generator"
 	"github.com/kaito-project/kaito/pkg/workspace/image"
 )
+
+// BuildNodeRequirementsForWorkspace creates node selector requirements for a workspace,
+// including enhanced selectors for NAP disabled scenarios
+func BuildNodeRequirementsForWorkspace(workspaceObj *kaitov1beta1.Workspace) []corev1.NodeSelectorRequirement {
+	nodeRequirements := make([]corev1.NodeSelectorRequirement, 0, len(workspaceObj.Resource.LabelSelector.MatchLabels)+1)
+
+	// Add original label selector requirements
+	for key, value := range workspaceObj.Resource.LabelSelector.MatchLabels {
+		nodeRequirements = append(nodeRequirements, corev1.NodeSelectorRequirement{
+			Key:      key,
+			Operator: corev1.NodeSelectorOpIn,
+			Values:   []string{value},
+		})
+	}
+
+	// When NAP is disabled, add workspace name requirement to ensure pods only run on labeled nodes
+	if featuregates.FeatureGates[consts.FeatureFlagDisableNodeAutoProvisioning] {
+		nodeRequirements = append(nodeRequirements, corev1.NodeSelectorRequirement{
+			Key:      "workspace.kaito.io/name",
+			Operator: corev1.NodeSelectorOpIn,
+			Values:   []string{workspaceObj.Name},
+		})
+	}
+
+	return nodeRequirements
+}
 
 func GenerateHeadlessServiceManifest(workspaceObj *kaitov1beta1.Workspace) *corev1.Service {
 	serviceName := fmt.Sprintf("%s-headless", workspaceObj.Name)
@@ -291,14 +319,7 @@ func GeneratePullerContainers(wObj *kaitov1beta1.Workspace, volumeMounts []corev
 }
 
 func GenerateDeploymentManifestWithPodTemplate(workspaceObj *kaitov1beta1.Workspace, tolerations []corev1.Toleration) *appsv1.Deployment {
-	nodeRequirements := make([]corev1.NodeSelectorRequirement, 0, len(workspaceObj.Resource.LabelSelector.MatchLabels))
-	for key, value := range workspaceObj.Resource.LabelSelector.MatchLabels {
-		nodeRequirements = append(nodeRequirements, corev1.NodeSelectorRequirement{
-			Key:      key,
-			Operator: corev1.NodeSelectorOpIn,
-			Values:   []string{value},
-		})
-	}
+	nodeRequirements := BuildNodeRequirementsForWorkspace(workspaceObj)
 
 	templateCopy := workspaceObj.Inference.Template.DeepCopy()
 

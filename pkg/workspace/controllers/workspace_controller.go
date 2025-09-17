@@ -96,6 +96,90 @@ func NewWorkspaceReconciler(client client.Client, scheme *runtime.Scheme, log lo
 	}
 }
 
+// queryAndBucketNodes queries nodes matching the label selector and groups them by GPU features,
+// excluding nodes that are already assigned to workspaces
+func (c *WorkspaceReconciler) queryAndBucketNodes(ctx context.Context, wObj *kaitov1beta1.Workspace) ([]utils.GPUNodeType, []*corev1.Node, error) {
+	// Convert label selector to map
+	selector, err := metav1.LabelSelectorAsSelector(wObj.Resource.LabelSelector)
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid label selector: %v", err)
+	}
+
+	// List nodes matching the selector
+	var nodeList corev1.NodeList
+	listOptions := &client.ListOptions{
+		LabelSelector: selector,
+	}
+
+	err = c.Client.List(ctx, &nodeList, listOptions)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to list nodes: %v", err)
+	}
+
+	if len(nodeList.Items) == 0 {
+		return nil, nil, fmt.Errorf("no nodes found matching label selector")
+	}
+
+	// Filter nodes for controller-specific requirements before bucketing
+	var availableNodes []*corev1.Node
+	for i := range nodeList.Items {
+		node := &nodeList.Items[i]
+
+		// Skip nodes that are already assigned to a workspace (but allow our own workspace)
+		if workspaceName, exists := node.Labels[WorkspaceNameLabel]; exists && workspaceName != wObj.Name {
+			continue
+		}
+
+		// Skip nodes that are not ready or are being deleted
+		if !resources.NodeIsReadyAndNotDeleting(node) {
+			continue
+		}
+
+		availableNodes = append(availableNodes, node)
+	}
+
+	// Use the common bucketing function
+	buckets, err := utils.BucketGPUNodes(availableNodes)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return buckets, availableNodes, nil
+}
+
+// selectNodesFromBucket selects the required number of nodes from a specific bucket
+func selectNodesFromBucket(availableNodes []*corev1.Node, bucket *utils.GPUNodeType, requiredNodes int) []*corev1.Node {
+	var selectedNodes []*corev1.Node
+
+	// Since the bucket already contains the correct nodes, we can select directly from it
+	for i, node := range bucket.Nodes {
+		if i >= requiredNodes {
+			break
+		}
+		selectedNodes = append(selectedNodes, node)
+	}
+
+	return selectedNodes
+}
+
+// labelSelectedNodes adds workspace labels to the selected nodes
+func (c *WorkspaceReconciler) labelSelectedNodes(ctx context.Context, wObj *kaitov1beta1.Workspace, selectedNodes []*corev1.Node) error {
+	for _, node := range selectedNodes {
+		// Create a patch to add the workspace label
+		patch := client.MergeFrom(node.DeepCopy())
+		if node.Labels == nil {
+			node.Labels = make(map[string]string)
+		}
+		node.Labels[WorkspaceNameLabel] = wObj.Name
+
+		if err := c.Client.Patch(ctx, node, patch); err != nil {
+			return fmt.Errorf("failed to label node %s: %w", node.Name, err)
+		}
+		klog.InfoS("Added workspace label to node", "node", node.Name, "workspace", wObj.Name)
+	}
+	return nil
+}
+
 func (c *WorkspaceReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	workspaceObj := &kaitov1beta1.Workspace{}
 	if err := c.Client.Get(ctx, req.NamespacedName, workspaceObj); err != nil {
@@ -368,39 +452,77 @@ func (c *WorkspaceReconciler) applyWorkspaceResource(ctx context.Context, wObj *
 		return err
 	}
 
-	// Find all nodes that meet the requirements, they are not necessarily created by machines/nodeClaims.
-	validNodes, err := c.getAllQualifiedNodes(ctx, wObj)
-	if err != nil {
-		return err
-	}
-
 	//nolint:staticcheck //SA1019: deprecate Resource.Count field
-	selectedNodes := utils.SelectNodes(validNodes, wObj.Resource.PreferredNodes, wObj.Status.WorkerNodes, lo.FromPtr(wObj.Resource.Count))
+	requiredNodeCount := lo.FromPtr(wObj.Resource.Count)
+	var selectedNodes []*corev1.Node
+	var err error
 
-	//nolint:staticcheck //SA1019: deprecate Resource.Count field
-	newNodesCount := lo.FromPtr(wObj.Resource.Count) - len(selectedNodes)
-
-	if newNodesCount > 0 {
-		// Check if node auto-provisioning is disabled
-		if featuregates.FeatureGates[consts.FeatureFlagDisableNodeAutoProvisioning] {
-			//nolint:staticcheck //SA1019: deprecate Resource.Count field
-			return fmt.Errorf("node auto-provisioning is disabled but insufficient nodes available: need %d nodes, have %d selected nodes", lo.FromPtr(wObj.Resource.Count), len(selectedNodes))
+	if featuregates.FeatureGates[consts.FeatureFlagDisableNodeAutoProvisioning] {
+		// New bucket-based node selection for NAP disabled
+		buckets, availableNodes, err := c.queryAndBucketNodes(ctx, wObj)
+		if err != nil {
+			return fmt.Errorf("failed to query and bucket nodes: %w", err)
 		}
 
-		klog.InfoS("need to create more nodes", "NodeCount", newNodesCount)
-		if err := workspace.UpdateStatusConditionIfNotMatch(ctx, c.Client, wObj,
-			kaitov1beta1.ConditionTypeNodeClaimStatus, metav1.ConditionUnknown,
-			"CreateNodeClaimPending", fmt.Sprintf("creating %d nodeClaims", newNodesCount)); err != nil {
-			klog.ErrorS(err, "failed to update workspace status", "workspace", klog.KObj(wObj))
+		if len(buckets) == 0 {
+			return fmt.Errorf("no GPU nodes found matching label selector")
+		}
+
+		// Try to find a bucket that has enough nodes
+		var selectedBucket *utils.GPUNodeType
+
+		for i := range buckets {
+			bucket := &buckets[i]
+			if len(bucket.Nodes) >= requiredNodeCount {
+				selectedBucket = bucket
+				selectedNodes = selectNodesFromBucket(availableNodes, bucket, requiredNodeCount)
+				break
+			}
+		}
+
+		if selectedBucket == nil || len(selectedNodes) < requiredNodeCount {
+			return fmt.Errorf("insufficient GPU nodes available: need %d nodes, found %d nodes across all buckets",
+				requiredNodeCount, len(availableNodes))
+		}
+
+		// Label the selected nodes with workspace name
+		if err := c.labelSelectedNodes(ctx, wObj, selectedNodes); err != nil {
+			return fmt.Errorf("failed to label selected nodes: %w", err)
+		}
+
+		klog.InfoS("Selected nodes for workspace using bucket-based approach",
+			"workspace", wObj.Name,
+			"selectedNodes", len(selectedNodes),
+			"gpuProduct", selectedBucket.GPUProduct,
+			"gpuCount", selectedBucket.GPUCount,
+			"gpuMemory", selectedBucket.GPUMemory.String())
+
+	} else {
+		// NAP enabled - use existing logic
+		validNodes, err := c.getAllQualifiedNodes(ctx, wObj)
+		if err != nil {
 			return err
 		}
 
-		err := c.createNewNodes(ctx, wObj, newNodesCount)
-		if err != nil {
-			return fmt.Errorf("failed to create new nodes: %w", err)
+		selectedNodes = utils.SelectNodes(validNodes, wObj.Resource.PreferredNodes, wObj.Status.WorkerNodes, requiredNodeCount)
+		newNodesCount := requiredNodeCount - len(selectedNodes)
+
+		if newNodesCount > 0 {
+			klog.InfoS("need to create more nodes", "NodeCount", newNodesCount)
+			if err := workspace.UpdateStatusConditionIfNotMatch(ctx, c.Client, wObj,
+				kaitov1beta1.ConditionTypeNodeClaimStatus, metav1.ConditionUnknown,
+				"CreateNodeClaimPending", fmt.Sprintf("creating %d nodeClaims", newNodesCount)); err != nil {
+				klog.ErrorS(err, "failed to update workspace status", "workspace", klog.KObj(wObj))
+				return err
+			}
+
+			err := c.createNewNodes(ctx, wObj, newNodesCount)
+			if err != nil {
+				return fmt.Errorf("failed to create new nodes: %w", err)
+			}
+			// terminate the current reconciliation and rely on NodeClaim creation event to trigger a new reconciliation
+			return reconcile.TerminalError(errors.New("waiting for new nodes to be created"))
 		}
-		// terminate the current reconciliation and rely on NodeClaim creation event to trigger a new reconciliation
-		return reconcile.TerminalError(errors.New("waiting for new nodes to be created"))
 	}
 
 	// Ensure all gpu plugins are running successfully.

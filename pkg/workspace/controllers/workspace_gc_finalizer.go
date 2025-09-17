@@ -15,7 +15,9 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -23,6 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
+	"github.com/kaito-project/kaito/pkg/featuregates"
 	"github.com/kaito-project/kaito/pkg/utils/consts"
 	"github.com/kaito-project/kaito/pkg/utils/nodeclaim"
 	"github.com/kaito-project/kaito/pkg/utils/workspace"
@@ -31,6 +34,14 @@ import (
 // garbageCollectWorkspace remove finalizer associated with workspace object.
 func (c *WorkspaceReconciler) garbageCollectWorkspace(ctx context.Context, wObj *kaitov1beta1.Workspace) (ctrl.Result, error) {
 	klog.InfoS("garbageCollectWorkspace", "workspace", klog.KObj(wObj))
+
+	// Remove workspace labels from nodes when NAP is disabled
+	if featuregates.FeatureGates[consts.FeatureFlagDisableNodeAutoProvisioning] {
+		if err := c.removeWorkspaceLabelsFromNodes(ctx, wObj); err != nil {
+			klog.ErrorS(err, "failed to remove workspace labels from nodes", "workspace", klog.KObj(wObj))
+			return ctrl.Result{}, err
+		}
+	}
 
 	// Check if there are any nodeClaims associated with this workspace.
 	ncList, err := nodeclaim.ListNodeClaim(ctx, wObj, c.Client)
@@ -64,4 +75,30 @@ func (c *WorkspaceReconciler) garbageCollectWorkspace(ctx context.Context, wObj 
 	klog.InfoS("successfully removed the workspace finalizers", "workspace", klog.KObj(wObj))
 
 	return ctrl.Result{}, nil
+}
+
+// removeWorkspaceLabelsFromNodes removes workspace labels from all nodes associated with the workspace
+func (c *WorkspaceReconciler) removeWorkspaceLabelsFromNodes(ctx context.Context, wObj *kaitov1beta1.Workspace) error {
+	// List all nodes with this workspace's label
+	nodeList := &corev1.NodeList{}
+	err := c.Client.List(ctx, nodeList, client.MatchingLabels{WorkspaceNameLabel: wObj.Name})
+	if err != nil {
+		return fmt.Errorf("failed to list nodes with workspace label: %w", err)
+	}
+
+	// Remove workspace label from each node
+	for i := range nodeList.Items {
+		node := &nodeList.Items[i]
+		if _, exists := node.Labels[WorkspaceNameLabel]; exists {
+			patch := client.MergeFrom(node.DeepCopy())
+			delete(node.Labels, WorkspaceNameLabel)
+
+			if err := c.Client.Patch(ctx, node, patch); err != nil {
+				return fmt.Errorf("failed to remove workspace label from node %s: %w", node.Name, err)
+			}
+			klog.InfoS("Removed workspace label from node", "node", node.Name, "workspace", wObj.Name)
+		}
+	}
+
+	return nil
 }

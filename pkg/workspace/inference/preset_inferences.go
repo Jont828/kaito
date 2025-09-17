@@ -324,15 +324,8 @@ func GenerateInferencePodSpec(gpuConfig *sku.GPUConfig, numNodes int) func(*gene
 		volumes = append(volumes, shmVolume)
 		volumeMounts = append(volumeMounts, shmVolumeMount)
 
-		// node selector
-		nodeRequirements := make([]corev1.NodeSelectorRequirement, 0, len(ctx.Workspace.Resource.LabelSelector.MatchLabels))
-		for key, value := range ctx.Workspace.Resource.LabelSelector.MatchLabels {
-			nodeRequirements = append(nodeRequirements, corev1.NodeSelectorRequirement{
-				Key:      key,
-				Operator: corev1.NodeSelectorOpIn,
-				Values:   []string{value},
-			})
-		}
+		// node selector - use enhanced requirements for NAP disabled scenarios
+		nodeRequirements := manifests.BuildNodeRequirementsForWorkspace(ctx.Workspace)
 
 		// resource requirements
 		resourceReq := corev1.ResourceRequirements{

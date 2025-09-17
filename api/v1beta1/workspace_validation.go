@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"os"
 	"reflect"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -48,74 +47,10 @@ const (
 	DefaultQloraConfigMapTemplate  = "qlora-params-template"
 	DefaultInferenceConfigTemplate = "inference-params-template"
 	MaxAdaptersNumber              = 10
-
-	// NVIDIA GPU labels for extracting GPU information
-	NvidiaGPUCountLabel  = "nvidia.com/gpu.count"
-	NvidiaGPUMemoryLabel = "nvidia.com/gpu.memory"
 )
 
-// GPUNodeType represents a group of nodes with identical GPU features
-type GPUNodeType struct {
-	// GPUProduct is the GPU model/product name.
-	GPUProduct string
-	// GPUCount is the number of GPUs per node.
-	GPUCount int64
-	// GPUMemory is the memory per GPU.
-	GPUMemory resource.Quantity
-	// NodeCount is the number of nodes in this bucket
-	NodeCount int
-	// NodeNames contains the names of nodes in this bucket
-	NodeNames []string
-}
-
-// extractGPUFeaturesFromNode extracts GPU features from a single node using nvidia.com labels
-func extractGPUFeaturesFromNode(node *corev1.Node) (*GPUNodeType, error) {
-	var gpuProduct string
-	var gpuCount int64
-	var gpuMemoryMB int64
-
-	// Extract GPU product
-	if product, exists := node.Labels["nvidia.com/gpu.product"]; exists {
-		gpuProduct = product
-	}
-
-	// Extract GPU count
-	if countStr, exists := node.Labels[NvidiaGPUCountLabel]; exists {
-		count, err := strconv.ParseInt(countStr, 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("invalid GPU count label: %v", err)
-		}
-		gpuCount = count
-	} else {
-		return nil, fmt.Errorf("missing nvidia.com/gpu.count label")
-	}
-
-	// Extract GPU memory per GPU (in MB)
-	if memStr, exists := node.Labels[NvidiaGPUMemoryLabel]; exists {
-		memMB, err := strconv.ParseInt(memStr, 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("invalid GPU memory label: %v", err)
-		}
-		gpuMemoryMB = memMB
-	} else {
-		return nil, fmt.Errorf("missing nvidia.com/gpu.memory label")
-	}
-
-	// Convert memory from MB to resource.Quantity (bytes)
-	gpuMemoryBytes := gpuMemoryMB * 1024 * 1024
-	gpuMemory := resource.NewQuantity(gpuMemoryBytes, resource.BinarySI)
-
-	return &GPUNodeType{
-		GPUProduct: gpuProduct,
-		GPUCount:   gpuCount,
-		GPUMemory:  *gpuMemory,
-		NodeCount:  1,
-		NodeNames:  []string{node.Name},
-	}, nil
-}
-
 // queryNodesWithGPUFeatures queries nodes matching the label selector and extracts their GPU features
-func (r *ResourceSpec) queryNodesWithGPUFeatures(ctx context.Context) ([]GPUNodeType, error) {
+func (r *ResourceSpec) queryNodesWithGPUFeatures(ctx context.Context) ([]utils.GPUNodeType, error) {
 	if k8sclient.Client == nil {
 		return nil, fmt.Errorf("k8s client not available")
 	}
@@ -141,59 +76,22 @@ func (r *ResourceSpec) queryNodesWithGPUFeatures(ctx context.Context) ([]GPUNode
 		return nil, fmt.Errorf("no nodes found matching label selector")
 	}
 
-	// Group nodes by GPU features
-	bucketMap := make(map[string]*GPUNodeType)
-
-	for _, node := range nodeList.Items {
-		gpuBucket, err := extractGPUFeaturesFromNode(&node)
-		if err != nil {
-			klog.Warningf("Failed to extract GPU features from node %s: %v", node.Name, err)
-			continue
-		}
-
-		// Create a unique key for bucketing based on GPU features
-		key := fmt.Sprintf("%s-%d-%s", gpuBucket.GPUProduct, gpuBucket.GPUCount, gpuBucket.GPUMemory.String())
-
-		if bucket, exists := bucketMap[key]; exists {
-			bucket.NodeCount++
-			bucket.NodeNames = append(bucket.NodeNames, node.Name)
-		} else {
-			bucketMap[key] = gpuBucket
-		}
+	// Convert to pointers
+	var nodes []*corev1.Node
+	for i := range nodeList.Items {
+		nodes = append(nodes, &nodeList.Items[i])
 	}
 
-	// Convert map to slice and sort by capacity (GPUs per node * GPU memory per GPU, then by total nodes)
-	var buckets []GPUNodeType
-	for _, bucket := range bucketMap {
-		buckets = append(buckets, *bucket)
-	}
-
-	// Sort buckets by total GPU capacity (descending): GPUs per node * memory per GPU * node count
-	sort.Slice(buckets, func(i, j int) bool {
-		capacityI := buckets[i].GPUCount * buckets[i].GPUMemory.Value() * int64(buckets[i].NodeCount)
-		capacityJ := buckets[j].GPUCount * buckets[j].GPUMemory.Value() * int64(buckets[j].NodeCount)
-
-		if capacityI != capacityJ {
-			return capacityI > capacityJ // Descending order
-		}
-
-		// If total capacity is equal, prefer buckets with more GPUs per node
-		if buckets[i].GPUCount != buckets[j].GPUCount {
-			return buckets[i].GPUCount > buckets[j].GPUCount
-		}
-
-		// If GPUs per node are equal, prefer buckets with more memory per GPU
-		return buckets[i].GPUMemory.Cmp(buckets[j].GPUMemory) > 0
-	})
-
-	return buckets, nil
+	// Bucket the nodes
+	buckets, err := utils.BucketGPUNodes(nodes)
+	return buckets, err
 }
 
 // canBucketSatisfyModel checks if a given bucket can satisfy the model requirements
-func canBucketSatisfyModel(bucket *GPUNodeType, modelGPUCount resource.Quantity, modelTotalGPUMemory resource.Quantity) (bool, int, string) {
+func canBucketSatisfyModel(bucket *utils.GPUNodeType, modelGPUCount resource.Quantity, modelTotalGPUMemory resource.Quantity) (bool, int, string) {
 	// Calculate total GPUs available in this bucket
-	totalAvailableGPUs := bucket.GPUCount * int64(bucket.NodeCount)
-	totalAvailableGPUMem := bucket.GPUMemory.Value() * bucket.GPUCount * int64(bucket.NodeCount)
+	totalAvailableGPUs := bucket.GPUCount * int64(len(bucket.Nodes))
+	totalAvailableGPUMem := bucket.GPUMemory.Value() * bucket.GPUCount * int64(len(bucket.Nodes))
 
 	// Check if we have enough GPUs
 	if totalAvailableGPUs < modelGPUCount.Value() {
@@ -220,9 +118,9 @@ func canBucketSatisfyModel(bucket *GPUNodeType, modelGPUCount resource.Quantity,
 		minNodesNeeded = nodesForMemory
 	}
 
-	if minNodesNeeded > bucket.NodeCount {
+	if minNodesNeeded > len(bucket.Nodes) {
 		return false, minNodesNeeded, fmt.Sprintf("insufficient nodes: bucket has %d nodes but requires %d nodes",
-			bucket.NodeCount, minNodesNeeded)
+			len(bucket.Nodes), minNodesNeeded)
 	}
 
 	return true, minNodesNeeded, ""
@@ -518,7 +416,7 @@ func (r *ResourceSpec) validateCreateWithInference(ctx context.Context, inferenc
 				modelTotalGPUMemory := resource.MustParse(params.TotalSafeTensorFileSize)
 
 				// Try to find a bucket that can satisfy the model requirements
-				var selectedBucket *GPUNodeType
+				var selectedBucket *utils.GPUNodeType
 				var nodesNeeded int
 				for i := range buckets {
 					canSatisfy, nodes, _ := canBucketSatisfyModel(&buckets[i], modelGPUCount, modelTotalGPUMemory)
@@ -539,7 +437,7 @@ func (r *ResourceSpec) validateCreateWithInference(ctx context.Context, inferenc
 					for i, bucket := range buckets {
 						_, _, reason := canBucketSatisfyModel(&bucket, modelGPUCount, modelTotalGPUMemory)
 						errorMessages = append(errorMessages, fmt.Sprintf("Bucket %d (%s, %d GPUs/node, %s/GPU, %d nodes): %s",
-							i+1, bucket.GPUProduct, bucket.GPUCount, bucket.GPUMemory.String(), bucket.NodeCount, reason))
+							i+1, bucket.GPUProduct, bucket.GPUCount, bucket.GPUMemory.String(), len(bucket.Nodes), reason))
 					}
 
 					if bypassResourceChecks {
@@ -551,7 +449,7 @@ func (r *ResourceSpec) validateCreateWithInference(ctx context.Context, inferenc
 					// Log successful match
 					klog.Infof("Selected GPU node bucket for preset %s: %s with %d GPUs/node, %s/GPU, using %d out of %d available nodes",
 						presetName, selectedBucket.GPUProduct, selectedBucket.GPUCount,
-						selectedBucket.GPUMemory.String(), nodesNeeded, selectedBucket.NodeCount)
+						selectedBucket.GPUMemory.String(), nodesNeeded, len(selectedBucket.Nodes))
 				}
 			}
 		}

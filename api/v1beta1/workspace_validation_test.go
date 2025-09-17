@@ -2089,9 +2089,9 @@ func TestResourceSpecValidateCreateWithInference_NAPDisabled(t *testing.T) {
 				Name: "test-node-a100",
 				Labels: map[string]string{
 					"node.kubernetes.io/instance-type": "Standard_NC24ads_A100_v4",
-					"nvidia.com/gpu.count":              "1",
-					"nvidia.com/gpu.memory":             "81920", // 80GB in MB
-					"nvidia.com/gpu.product":            "A100-SXM-80GB",
+					"nvidia.com/gpu.count":             "1",
+					"nvidia.com/gpu.memory":            "81920", // 80GB in MB
+					"nvidia.com/gpu.product":           "A100-SXM-80GB",
 				},
 			},
 		},
@@ -2110,11 +2110,11 @@ func TestResourceSpecValidateCreateWithInference_NAPDisabled(t *testing.T) {
 	k8sclient.SetGlobalClient(client)
 
 	tests := []struct {
-		name           string
-		resourceSpec   ResourceSpec
-		inferenceSpec  InferenceSpec
-		expectErrs     bool
-		errContent     string
+		name          string
+		resourceSpec  ResourceSpec
+		inferenceSpec InferenceSpec
+		expectErrs    bool
+		errContent    string
 	}{
 		{
 			name: "Should error when instanceType is specified with NAP disabled",
@@ -2240,11 +2240,11 @@ func TestResourceSpecValidateCreateWithInference_NAPEnabled(t *testing.T) {
 	os.Setenv("CLOUD_PROVIDER", "azure")
 
 	tests := []struct {
-		name           string
-		resourceSpec   ResourceSpec
-		inferenceSpec  InferenceSpec
-		expectErrs     bool
-		errContent     string
+		name          string
+		resourceSpec  ResourceSpec
+		inferenceSpec InferenceSpec
+		expectErrs    bool
+		errContent    string
 	}{
 		{
 			name: "Should error when instanceType is not specified with NAP enabled",

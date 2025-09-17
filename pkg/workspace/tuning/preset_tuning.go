@@ -256,15 +256,8 @@ func GenerateBasicTuningPodSpec(skuNumGPUs int) func(*generator.WorkspaceGenerat
 		spec.Volumes = volumes
 		spec.RestartPolicy = corev1.RestartPolicyNever
 
-		// Add node affinity based on label selector from workspace resource
-		nodeRequirements := make([]corev1.NodeSelectorRequirement, 0, len(ctx.Workspace.Resource.LabelSelector.MatchLabels))
-		for key, value := range ctx.Workspace.Resource.LabelSelector.MatchLabels {
-			nodeRequirements = append(nodeRequirements, corev1.NodeSelectorRequirement{
-				Key:      key,
-				Operator: corev1.NodeSelectorOpIn,
-				Values:   []string{value},
-			})
-		}
+		// Add node affinity based on label selector from workspace resource with enhanced NAP support
+		nodeRequirements := manifests.BuildNodeRequirementsForWorkspace(ctx.Workspace)
 
 		spec.Affinity = &corev1.Affinity{
 			NodeAffinity: &corev1.NodeAffinity{
