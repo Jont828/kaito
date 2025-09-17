@@ -14,7 +14,7 @@
 package v1beta1
 
 import (
-	v1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -96,7 +96,7 @@ type InferenceSpec struct {
 	// +kubebuilder:pruning:PreserveUnknownFields
 	// +kubebuilder:validation:Schemaless
 	// +optional
-	Template *v1.PodTemplateSpec `json:"template,omitempty"`
+	Template *corev1.PodTemplateSpec `json:"template,omitempty"`
 	// Config specifies the name of a custom ConfigMap that contains inference arguments.
 	// If specified, the ConfigMap must be in the same namespace as the Workspace custom resource.
 	// +optional
@@ -148,7 +148,7 @@ type DataSource struct {
 	// +kubebuilder:pruning:PreserveUnknownFields
 	// +kubebuilder:validation:Schemaless
 	// +optional
-	Volume *v1.VolumeSource `json:"volumeSource,omitempty"`
+	Volume *corev1.VolumeSource `json:"volumeSource,omitempty"`
 	// The name of the image that contains the source data. The assumption is that the source data locates in the
 	// `data` directory in the image.
 	// +optional
@@ -163,7 +163,7 @@ type DataDestination struct {
 	// +kubebuilder:pruning:PreserveUnknownFields
 	// +kubebuilder:validation:Schemaless
 	// +optional
-	Volume *v1.VolumeSource `json:"volumeSource,omitempty"`
+	Volume *corev1.VolumeSource `json:"volumeSource,omitempty"`
 	// Name of the image where the output data is pushed to.
 	// +optional
 	Image string `json:"image,omitempty"`

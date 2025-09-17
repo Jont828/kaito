@@ -2083,13 +2083,26 @@ func TestResourceSpecValidateCreateWithInference_NAPDisabled(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = v1.AddToScheme(scheme)
 	client := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(
-		// Mock node for the test
+		// Mock node with A100 labels for instance type test
 		&v1.Node{
 			ObjectMeta: metav1.ObjectMeta{
-				Name: "test-node-1",
+				Name: "test-node-a100",
 				Labels: map[string]string{
-					"nvidia.com/gpu.count":  "1",
-					"nvidia.com/gpu.memory": "24576", // 24GB in MB
+					"node.kubernetes.io/instance-type": "Standard_NC24ads_A100_v4",
+					"nvidia.com/gpu.count":              "1",
+					"nvidia.com/gpu.memory":             "81920", // 80GB in MB
+					"nvidia.com/gpu.product":            "A100-SXM-80GB",
+				},
+			},
+		},
+		// Mock node with smaller GPU for memory testing
+		&v1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "test-node-small",
+				Labels: map[string]string{
+					"nvidia.com/gpu.count":   "1",
+					"nvidia.com/gpu.memory":  "24576", // 24GB in MB
+					"nvidia.com/gpu.product": "RTX-A6000",
 				},
 			},
 		},
@@ -2112,7 +2125,6 @@ func TestResourceSpecValidateCreateWithInference_NAPDisabled(t *testing.T) {
 						"node.kubernetes.io/instance-type": "Standard_NC24ads_A100_v4",
 					},
 				},
-				PreferredNodes: []string{"test-node-1"},
 			},
 			inferenceSpec: InferenceSpec{
 				// No preset - test without preset validation first
@@ -2125,11 +2137,9 @@ func TestResourceSpecValidateCreateWithInference_NAPDisabled(t *testing.T) {
 			resourceSpec: ResourceSpec{
 				LabelSelector: &metav1.LabelSelector{
 					MatchLabels: map[string]string{
-						"nvidia.com/gpu.count":  "1",
-						"nvidia.com/gpu.memory": "24576", // 24GB in MB
+						"nvidia.com/gpu.count": "1",
 					},
 				},
-				PreferredNodes: []string{"test-node-1"},
 			},
 			inferenceSpec: InferenceSpec{
 				// No preset to avoid preset validation issues
@@ -2141,11 +2151,9 @@ func TestResourceSpecValidateCreateWithInference_NAPDisabled(t *testing.T) {
 			resourceSpec: ResourceSpec{
 				LabelSelector: &metav1.LabelSelector{
 					MatchLabels: map[string]string{
-						"nvidia.com/gpu.count":  "1",
-						"nvidia.com/gpu.memory": "24576", // 24GB in MB, insufficient for llama-3.3-70b
+						"nvidia.com/gpu.product": "RTX-A6000", // This matches the small GPU node
 					},
 				},
-				PreferredNodes: []string{"test-node-1"},
 			},
 			inferenceSpec: InferenceSpec{
 				Preset: &PresetSpec{
@@ -2155,7 +2163,25 @@ func TestResourceSpecValidateCreateWithInference_NAPDisabled(t *testing.T) {
 				},
 			},
 			expectErrs: true,
-			errContent: " Gi", // Should show memory in GiB format with space
+			errContent: "No suitable node configuration found", // Should show detailed error about buckets
+		},
+		{
+			name: "Should successfully select A100 bucket when available",
+			resourceSpec: ResourceSpec{
+				LabelSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						"nvidia.com/gpu.product": "A100-SXM-80GB", // This matches the large GPU node
+					},
+				},
+			},
+			inferenceSpec: InferenceSpec{
+				Preset: &PresetSpec{
+					PresetMeta: PresetMeta{
+						Name: ModelName("test-validation"), // This will have high memory requirement from our mock
+					},
+				},
+			},
+			expectErrs: false, // Should pass with A100 node
 		},
 	}
 

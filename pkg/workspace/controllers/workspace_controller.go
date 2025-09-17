@@ -528,6 +528,7 @@ func (c *WorkspaceReconciler) determineNodeOSDiskSize(wObj *kaitov1beta1.Workspa
 func (c *WorkspaceReconciler) createAllNodeClaims(ctx context.Context, wObj *kaitov1beta1.Workspace, count int, nodeOSDiskSize string) ([]*karpenterv1.NodeClaim, error) {
 	klog.InfoS("Creating multiple NodeClaims", "count", count, "workspace", klog.KObj(wObj))
 
+	fmt.Printf("Hi Tilt\n")
 	nodeClaims := make([]*karpenterv1.NodeClaim, 0, count)
 
 	for range count {

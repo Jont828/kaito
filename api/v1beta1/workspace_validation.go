@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -53,69 +54,178 @@ const (
 	NvidiaGPUMemoryLabel = "nvidia.com/gpu.memory"
 )
 
-// GPUFeatures holds GPU information extracted from nvidia.com labels
-type GPUFeatures struct {
-	GPUCount  int
-	GPUMemGB  int64
-	Available bool
+// GPUNodeType represents a group of nodes with identical GPU features
+type GPUNodeType struct {
+	// GPUProduct is the GPU model/product name.
+	GPUProduct string
+	// GPUCount is the number of GPUs per node.
+	GPUCount int64
+	// GPUMemory is the memory per GPU.
+	GPUMemory resource.Quantity
+	// NodeCount is the number of nodes in this bucket
+	NodeCount int
+	// NodeNames contains the names of nodes in this bucket
+	NodeNames []string
 }
 
-// extractGPUInfoFromPreferredNodes extracts GPU information from preferred nodes using nvidia.com labels
-func (r *ResourceSpec) extractGPUInfoFromPreferredNodes(ctx context.Context) (*GPUFeatures, error) {
-	if len(r.PreferredNodes) == 0 {
-		return &GPUFeatures{Available: false}, nil
+// extractGPUFeaturesFromNode extracts GPU features from a single node using nvidia.com labels
+func extractGPUFeaturesFromNode(node *corev1.Node) (*GPUNodeType, error) {
+	var gpuProduct string
+	var gpuCount int64
+	var gpuMemoryMB int64
+
+	// Extract GPU product
+	if product, exists := node.Labels["nvidia.com/gpu.product"]; exists {
+		gpuProduct = product
 	}
 
-	if k8sclient.Client == nil {
-		return &GPUFeatures{Available: false}, nil
-	}
-
-	var totalGPUCount int
-	var totalGPUMemMB int64
-	validNodes := 0
-
-	for _, nodeName := range r.PreferredNodes {
-		var node corev1.Node
-		err := k8sclient.Client.Get(ctx, client.ObjectKey{Name: nodeName}, &node)
+	// Extract GPU count
+	if countStr, exists := node.Labels[NvidiaGPUCountLabel]; exists {
+		count, err := strconv.ParseInt(countStr, 10, 64)
 		if err != nil {
-			klog.Warningf("Failed to get node %s: %v", nodeName, err)
+			return nil, fmt.Errorf("invalid GPU count label: %v", err)
+		}
+		gpuCount = count
+	} else {
+		return nil, fmt.Errorf("missing nvidia.com/gpu.count label")
+	}
+
+	// Extract GPU memory per GPU (in MB)
+	if memStr, exists := node.Labels[NvidiaGPUMemoryLabel]; exists {
+		memMB, err := strconv.ParseInt(memStr, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid GPU memory label: %v", err)
+		}
+		gpuMemoryMB = memMB
+	} else {
+		return nil, fmt.Errorf("missing nvidia.com/gpu.memory label")
+	}
+
+	// Convert memory from MB to resource.Quantity (bytes)
+	gpuMemoryBytes := gpuMemoryMB * 1024 * 1024
+	gpuMemory := resource.NewQuantity(gpuMemoryBytes, resource.BinarySI)
+
+	return &GPUNodeType{
+		GPUProduct: gpuProduct,
+		GPUCount:   gpuCount,
+		GPUMemory:  *gpuMemory,
+		NodeCount:  1,
+		NodeNames:  []string{node.Name},
+	}, nil
+}
+
+// queryNodesWithGPUFeatures queries nodes matching the label selector and extracts their GPU features
+func (r *ResourceSpec) queryNodesWithGPUFeatures(ctx context.Context) ([]GPUNodeType, error) {
+	if k8sclient.Client == nil {
+		return nil, fmt.Errorf("k8s client not available")
+	}
+
+	// Convert label selector to map
+	selector, err := metav1.LabelSelectorAsSelector(r.LabelSelector)
+	if err != nil {
+		return nil, fmt.Errorf("invalid label selector: %v", err)
+	}
+
+	// List nodes matching the selector
+	var nodeList corev1.NodeList
+	listOptions := &client.ListOptions{
+		LabelSelector: selector,
+	}
+
+	err = k8sclient.Client.List(ctx, &nodeList, listOptions)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list nodes: %v", err)
+	}
+
+	if len(nodeList.Items) == 0 {
+		return nil, fmt.Errorf("no nodes found matching label selector")
+	}
+
+	// Group nodes by GPU features
+	bucketMap := make(map[string]*GPUNodeType)
+
+	for _, node := range nodeList.Items {
+		gpuBucket, err := extractGPUFeaturesFromNode(&node)
+		if err != nil {
+			klog.Warningf("Failed to extract GPU features from node %s: %v", node.Name, err)
 			continue
 		}
 
-		// Check if node has nvidia.com labels
-		if gpuCount, exists := node.Labels[NvidiaGPUCountLabel]; exists {
-			count, err := strconv.Atoi(gpuCount)
-			if err != nil {
-				klog.Warningf("Invalid GPU count label on node %s: %v", nodeName, err)
-				continue
-			}
-			totalGPUCount += count
-		}
+		// Create a unique key for bucketing based on GPU features
+		key := fmt.Sprintf("%s-%d-%s", gpuBucket.GPUProduct, gpuBucket.GPUCount, gpuBucket.GPUMemory.String())
 
-		if gpuMem, exists := node.Labels[NvidiaGPUMemoryLabel]; exists {
-			memMB, err := strconv.ParseInt(gpuMem, 10, 64)
-			if err != nil {
-				klog.Warningf("Invalid GPU memory label on node %s: %v", nodeName, err)
-				continue
-			}
-			totalGPUMemMB += memMB
+		if bucket, exists := bucketMap[key]; exists {
+			bucket.NodeCount++
+			bucket.NodeNames = append(bucket.NodeNames, node.Name)
+		} else {
+			bucketMap[key] = gpuBucket
 		}
-
-		validNodes++
 	}
 
-	if validNodes == 0 {
-		return &GPUFeatures{Available: false}, nil
+	// Convert map to slice and sort by capacity (GPUs per node * GPU memory per GPU, then by total nodes)
+	var buckets []GPUNodeType
+	for _, bucket := range bucketMap {
+		buckets = append(buckets, *bucket)
 	}
 
-	// Convert memory from MB to GB
-	totalGPUMemGB := totalGPUMemMB / 1024
+	// Sort buckets by total GPU capacity (descending): GPUs per node * memory per GPU * node count
+	sort.Slice(buckets, func(i, j int) bool {
+		capacityI := buckets[i].GPUCount * buckets[i].GPUMemory.Value() * int64(buckets[i].NodeCount)
+		capacityJ := buckets[j].GPUCount * buckets[j].GPUMemory.Value() * int64(buckets[j].NodeCount)
 
-	return &GPUFeatures{
-		GPUCount:  totalGPUCount,
-		GPUMemGB:  totalGPUMemGB,
-		Available: true,
-	}, nil
+		if capacityI != capacityJ {
+			return capacityI > capacityJ // Descending order
+		}
+
+		// If total capacity is equal, prefer buckets with more GPUs per node
+		if buckets[i].GPUCount != buckets[j].GPUCount {
+			return buckets[i].GPUCount > buckets[j].GPUCount
+		}
+
+		// If GPUs per node are equal, prefer buckets with more memory per GPU
+		return buckets[i].GPUMemory.Cmp(buckets[j].GPUMemory) > 0
+	})
+
+	return buckets, nil
+}
+
+// canBucketSatisfyModel checks if a given bucket can satisfy the model requirements
+func canBucketSatisfyModel(bucket *GPUNodeType, modelGPUCount resource.Quantity, modelTotalGPUMemory resource.Quantity) (bool, int, string) {
+	// Calculate total GPUs available in this bucket
+	totalAvailableGPUs := bucket.GPUCount * int64(bucket.NodeCount)
+	totalAvailableGPUMem := bucket.GPUMemory.Value() * bucket.GPUCount * int64(bucket.NodeCount)
+
+	// Check if we have enough GPUs
+	if totalAvailableGPUs < modelGPUCount.Value() {
+		return false, 0, fmt.Sprintf("insufficient GPUs: bucket has %d GPUs but model requires %d",
+			totalAvailableGPUs, modelGPUCount.Value())
+	}
+
+	// Check if we have enough GPU memory
+	if totalAvailableGPUMem < modelTotalGPUMemory.Value() {
+		totalAvailableGPUMemGiB := totalAvailableGPUMem / consts.GiBToBytes
+		modelTotalGPUMemoryGiB := modelTotalGPUMemory.Value() / consts.GiBToBytes
+		return false, 0, fmt.Sprintf("insufficient GPU memory: bucket has %d Gi (%s bytes) but model requires %d Gi (%s bytes)",
+			totalAvailableGPUMemGiB, resource.NewQuantity(totalAvailableGPUMem, resource.BinarySI).String(),
+			modelTotalGPUMemoryGiB, modelTotalGPUMemory.String())
+	}
+
+	// Calculate minimum nodes needed based on GPU count and memory constraints
+	nodesForGPUs := int((modelGPUCount.Value() + bucket.GPUCount - 1) / bucket.GPUCount) // Ceiling division
+	memoryPerNode := bucket.GPUMemory.Value() * bucket.GPUCount
+	nodesForMemory := int((modelTotalGPUMemory.Value() + memoryPerNode - 1) / memoryPerNode) // Ceiling division
+
+	minNodesNeeded := nodesForGPUs
+	if nodesForMemory > minNodesNeeded {
+		minNodesNeeded = nodesForMemory
+	}
+
+	if minNodesNeeded > bucket.NodeCount {
+		return false, minNodesNeeded, fmt.Sprintf("insufficient nodes: bucket has %d nodes but requires %d nodes",
+			bucket.NodeCount, minNodesNeeded)
+	}
+
+	return true, minNodesNeeded, ""
 }
 
 func (w *Workspace) SupportedVerbs() []admissionregistrationv1.OperationType {
@@ -131,14 +241,8 @@ func (w *Workspace) Validate(ctx context.Context) (errs *apis.FieldError) {
 		errs = errs.Also(apis.ErrInvalidValue(strings.Join(errmsgs, ", "), "name"))
 	}
 
-	// Check if node auto-provisioning is disabled and validate preferred nodes
-	if featuregates.FeatureGates[consts.FeatureFlagDisableNodeAutoProvisioning] {
-		if len(w.Resource.PreferredNodes) < *w.Resource.Count {
-			errs = errs.Also(apis.ErrInvalidValue(
-				fmt.Sprintf("When node auto-provisioning is disabled, the number of preferred nodes (%d) must be at least the required amount (%d) set in count",
-					len(w.Resource.PreferredNodes), *w.Resource.Count), "preferredNodes"))
-		}
-	}
+	// Note: When NAP is disabled, node validation is handled in validateCreateWithInference
+	// based on label selector matching and GPU features, not preferred nodes list
 
 	base := apis.GetBaseline(ctx)
 	if base == nil {
@@ -392,68 +496,62 @@ func (r *ResourceSpec) validateCreateWithInference(ctx context.Context, inferenc
 		}
 	}
 	instanceType := string(r.InstanceType)
-	// When NAP is disabled, validate using nvidia.com labels from preferred nodes instead of SKU lookup
+	// When NAP is disabled, validate using nvidia.com labels from nodes matching label selector instead of SKU lookup
 	if featuregates.FeatureGates[consts.FeatureFlagDisableNodeAutoProvisioning] {
 		if instanceType != "" {
 			// TODO: we can change this to be more flexible.
-			errs = errs.Also(apis.ErrInvalidValue("Instance type should not be specified when NAP is disabled. Use preferred nodes with nvidia.com labels instead", "instanceType"))
+			errs = errs.Also(apis.ErrInvalidValue("Instance type should not be specified when NAP is disabled. Use label selector to target nodes with nvidia.com labels instead", "instanceType"))
 		}
 
 		if presetName != "" {
-			// TODO: change this so it works for non-homogeneous nodes.
-			gpuInfo, err := r.extractGPUInfoFromPreferredNodes(ctx)
+			// Query nodes matching label selector and group by GPU features
+			buckets, err := r.queryNodesWithGPUFeatures(ctx)
 			if err != nil {
-				errs = errs.Also(apis.ErrGeneric(fmt.Sprintf("Failed to extract GPU info from preferred nodes: %v", err), "preferredNodes"))
-			} else if gpuInfo.Available {
+				errs = errs.Also(apis.ErrGeneric(fmt.Sprintf("Failed to query nodes with GPU features: %v", err), "labelSelector"))
+			} else if len(buckets) == 0 {
+				errs = errs.Also(apis.ErrGeneric("No nodes found with valid GPU features matching label selector", "labelSelector"))
+			} else {
 				modelPreset := plugin.KaitoModelRegister.MustGet(presetName)
 				params := modelPreset.GetInferenceParameters()
-
-				totalGPUCount := resource.NewQuantity(int64(gpuInfo.GPUCount), resource.DecimalSI)
-				totalGPUMemory := resource.NewQuantity(gpuInfo.GPUMemGB*consts.GiBToBytes, resource.BinarySI)
 
 				modelGPUCount := resource.MustParse(params.GPUCountRequirement)
 				modelTotalGPUMemory := resource.MustParse(params.TotalSafeTensorFileSize)
 
-				// Check GPU count requirement
-				if totalGPUCount.Cmp(modelGPUCount) < 0 {
-					if bypassResourceChecks {
-						klog.Warningf("Bypassing resource check: Insufficient number of GPUs detected but continuing due to bypass flag. Preferred nodes provide %d GPUs, but preset %s requires at least %d GPUs",
-							totalGPUCount.Value(), presetName, modelGPUCount.Value())
-					} else {
-						errs = errs.Also(apis.ErrInvalidValue(
-							fmt.Sprintf(
-								"Insufficient number of GPUs: Preferred nodes provide %d GPUs, but preset %s requires at least %d GPUs",
-								totalGPUCount.Value(),
-								presetName,
-								modelGPUCount.Value(),
-							),
-							"preferredNodes",
-						))
+				// Try to find a bucket that can satisfy the model requirements
+				var selectedBucket *GPUNodeType
+				var nodesNeeded int
+				for i := range buckets {
+					canSatisfy, nodes, _ := canBucketSatisfyModel(&buckets[i], modelGPUCount, modelTotalGPUMemory)
+					if canSatisfy {
+						selectedBucket = &buckets[i]
+						nodesNeeded = nodes
+						break
 					}
 				}
 
-				// Check GPU memory requirement
-				if totalGPUMemory.Cmp(modelTotalGPUMemory) < 0 {
-					// Convert to GiB for readable error messages
-					totalGPUMemoryGiB := totalGPUMemory.Value() / consts.GiBToBytes
-					modelTotalGPUMemoryGiB := modelTotalGPUMemory.Value() / consts.GiBToBytes
+				if selectedBucket == nil {
+					// No bucket can satisfy the requirements, build detailed error message
+					var errorMessages []string
+					errorMessages = append(errorMessages, fmt.Sprintf("No suitable node configuration found for preset %s", presetName))
+					errorMessages = append(errorMessages, fmt.Sprintf("Model requires: %d GPUs, %s total GPU memory",
+						modelGPUCount.Value(), modelTotalGPUMemory.String()))
+
+					for i, bucket := range buckets {
+						_, _, reason := canBucketSatisfyModel(&bucket, modelGPUCount, modelTotalGPUMemory)
+						errorMessages = append(errorMessages, fmt.Sprintf("Bucket %d (%s, %d GPUs/node, %s/GPU, %d nodes): %s",
+							i+1, bucket.GPUProduct, bucket.GPUCount, bucket.GPUMemory.String(), bucket.NodeCount, reason))
+					}
 
 					if bypassResourceChecks {
-						klog.Warningf("Bypassing resource check: Insufficient total GPU memory detected but continuing due to bypass flag. Preferred nodes have a total of %d Gi (%s bytes), but preset %s requires at least %d Gi (%s bytes)",
-							totalGPUMemoryGiB, totalGPUMemory.String(), presetName, modelTotalGPUMemoryGiB, modelTotalGPUMemory.String())
+						klog.Warningf("Bypassing resource check: %s", strings.Join(errorMessages, "; "))
 					} else {
-						errs = errs.Also(apis.ErrInvalidValue(
-							fmt.Sprintf(
-								"Insufficient total GPU memory: Preferred nodes have a total of %d Gi (%s bytes), but preset %s requires at least %d Gi (%s bytes)",
-								totalGPUMemoryGiB,
-								totalGPUMemory.String(),
-								presetName,
-								modelTotalGPUMemoryGiB,
-								modelTotalGPUMemory.String(),
-							),
-							"preferredNodes",
-						))
+						errs = errs.Also(apis.ErrInvalidValue(strings.Join(errorMessages, "; "), "labelSelector"))
 					}
+				} else {
+					// Log successful match
+					klog.Infof("Selected GPU node bucket for preset %s: %s with %d GPUs/node, %s/GPU, using %d out of %d available nodes",
+						presetName, selectedBucket.GPUProduct, selectedBucket.GPUCount,
+						selectedBucket.GPUMemory.String(), nodesNeeded, selectedBucket.NodeCount)
 				}
 			}
 		}
