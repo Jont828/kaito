@@ -24,15 +24,15 @@ import psutil
 import pynvml
 import torch
 import uvloop
-import vllm.entrypoints.openai.api_server as api_server
 import vllm.envs as envs
 import yaml
-from vllm.config import VllmConfig
+from vllm.config.vllm import VllmConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.engine.llm_engine import LLMEngine
-from vllm.executor.executor_base import ExecutorBase
+from vllm.entrypoints.openai.api_server import run_server
+from vllm.entrypoints.openai.cli_args import make_arg_parser
 from vllm.lora.request import LoRARequest
-from vllm.utils import FlexibleArgumentParser
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 # Initialize logger
 logger = logging.getLogger(__name__)
@@ -51,7 +51,7 @@ class KAITOArgumentParser(argparse.ArgumentParser):
         super().__init__(*args, **kwargs)
 
         # Initialize vllm parser
-        self.vllm_parser = api_server.make_arg_parser(self.vllm_parser)
+        self.vllm_parser = make_arg_parser(self.vllm_parser)
         self._reset_vllm_defaults()
 
         # KAITO only args
@@ -181,25 +181,23 @@ def load_lora_adapters(adapters_dir: str) -> list[LoRARequest] | None:
 def find_max_available_seq_len(vllm_config: VllmConfig, max_probe_steps: int) -> int:
     """
     Load model and run profiler to find max available seq len.
+
+    NOTE: This function is currently incompatible with vLLM v0.11.2+ which uses the v1 engine.
+    The v1 engine has a different executor API:
+    - LLMEngine._get_executor_cls() method doesn't exist
+    - ExecutorBase.determine_num_available_blocks() is replaced by Executor.determine_available_memory()
+    - Executor instantiation pattern is different
+
+    For now, this function is disabled. Users should set max_model_len explicitly or rely on
+    vLLM's automatic memory management.
+
+    TODO: Reimplement this profiling logic using v1 API if needed.
     """
-    executor_class = LLMEngine._get_executor_cls(vllm_config)
-    if vllm_config.scheduler_config.enable_chunked_prefill:
-        logger.info("Chunked Prefill is enabled, skip probing.")
-        return vllm_config.model_config.max_model_len
-    executor = executor_class(vllm_config=vllm_config)
-
-    res = binary_search_with_limited_steps(
-        vllm_config.model_config.max_model_len,
-        max_probe_steps,
-        lambda x: is_context_length_safe(executor, x),
+    logger.warning(
+        "find_max_available_seq_len is disabled for vLLM v0.11.2+. "
+        "Using vLLM's default max_model_len. Set max_model_len explicitly if needed."
     )
-
-    # release memory
-    del executor
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    return res
+    return vllm_config.model_config.max_model_len
 
 
 def binary_search_with_limited_steps(
@@ -235,9 +233,13 @@ def binary_search_with_limited_steps(
     return low
 
 
-def is_context_length_safe(executor: ExecutorBase, context_length: int) -> bool:
+def is_context_length_safe(executor: Any, context_length: int) -> bool:
     """
     Check if the available gpu blocks is enough for the given num_gpu_blocks.
+
+    NOTE: This function is currently incompatible with vLLM v0.11.2+ which uses the v1 engine.
+    The v1 executor API doesn't have determine_num_available_blocks() method.
+    This function is kept for reference but is not used in v0.11.2+.
     """
     # Profile memory usage with max_num_sequences sequences and the total
     # number of tokens equal to max_num_batched_tokens.
@@ -247,6 +249,7 @@ def is_context_length_safe(executor: ExecutorBase, context_length: int) -> bool:
             f"Try to determine available gpu blocks for context length {context_length}"
         )
         # see https://github.com/vllm-project/vllm/blob/v0.7.2/vllm/engine/llm_engine.py#L416
+        # NOTE: determine_num_available_blocks() doesn't exist in v1 executor API
         available_gpu_blocks, _ = executor.determine_num_available_blocks()
     except torch.OutOfMemoryError:
         return False
@@ -256,6 +259,13 @@ def is_context_length_safe(executor: ExecutorBase, context_length: int) -> bool:
 
 
 def try_get_max_available_seq_len(args: argparse.Namespace) -> int | None:
+    """
+    Attempt to determine the maximum available sequence length that fits in GPU memory.
+
+    NOTE: For vLLM v0.11.2+, the profiling logic is disabled due to v1 API changes.
+    The function will return None and rely on vLLM's automatic memory management.
+    Set max_model_len explicitly in args if you need a specific value.
+    """
     if args.max_model_len is not None:
         logger.info(f"max_model_len is set to {args.max_model_len}, skip probing.")
         return None
@@ -274,30 +284,32 @@ def try_get_max_available_seq_len(args: argparse.Namespace) -> int | None:
     if max_probe_steps <= 0:
         return None
 
-    engine_args = EngineArgs.from_cli_args(args)
-    # read the model config from hf weights path.
-    # vllm will perform different parser for different model architectures
-    # and read it into a unified EngineConfig.
-    vllm_config = engine_args.create_engine_config()
+    # NOTE: The profiling logic below is disabled for vLLM v0.11.2+ compatibility
+    # The v1 engine API doesn't support the old executor-based profiling approach
+    logger.info(
+        "Memory profiling is disabled for vLLM v0.11.2+. "
+        "Using vLLM's default max_model_len. "
+        "Set --max-model-len explicitly if needed."
+    )
+    return None
 
-    max_model_len = vllm_config.model_config.max_model_len
-    available_seq_len = max_model_len
-    logger.info("Try run profiler to find max available seq len")
-    available_seq_len = find_max_available_seq_len(vllm_config, max_probe_steps)
-    # see https://github.com/vllm-project/vllm/blob/v0.7.2/vllm/worker/worker.py#L539
-    if available_seq_len <= 0:
-        raise ValueError(
-            "No available memory for the cache blocks. "
-            "Try increasing `gpu_memory_utilization` when "
-            "initializing the engine."
-        )
-
-    if available_seq_len != max_model_len:
-        logger.info(f"Set max_model_len from {max_model_len} to {available_seq_len}")
-        return available_seq_len
-    else:
-        logger.info(f"Using model default max_model_len {max_model_len}")
-        return None
+    # Original profiling code kept for reference (not executed):
+    # engine_args = EngineArgs.from_cli_args(args)
+    # vllm_config = engine_args.create_engine_config()
+    # max_model_len = vllm_config.model_config.max_model_len
+    # available_seq_len = find_max_available_seq_len(vllm_config, max_probe_steps)
+    # if available_seq_len <= 0:
+    #     raise ValueError(
+    #         "No available memory for the cache blocks. "
+    #         "Try increasing `gpu_memory_utilization` when "
+    #         "initializing the engine."
+    #     )
+    # if available_seq_len != max_model_len:
+    #     logger.info(f"Set max_model_len from {max_model_len} to {available_seq_len}")
+    #     return available_seq_len
+    # else:
+    #     logger.info(f"Using model default max_model_len {max_model_len}")
+    #     return None
 
 
 def get_max_gpu_memory_utilization(device_index: int = 0) -> float:
@@ -325,31 +337,17 @@ def get_max_gpu_memory_utilization(device_index: int = 0) -> float:
 def set_kv_cache_offloading_if_appliable(args: argparse.Namespace) -> None:
     """
     Set KV cache offloading to CPU RAM if applicable.
-    This is only applicable when VLLM_USE_V1 is enabled and
-    kaito_kv_cache_cpu_memory_utilization is set.
+    This is applicable when kaito_kv_cache_cpu_memory_utilization is set.
+    In vLLM v0.11.2+, the v1 engine is the default implementation.
     """
-    if (
-        not envs.is_set("VLLM_USE_V1")
-        and args.kaito_kv_cache_cpu_memory_utilization > 0
-    ):
-        logger.info(
-            f"VLLM_USE_V1 is not set, but kaito_kv_cache_cpu_memory_utilization is set as {args.kaito_kv_cache_cpu_memory_utilization}, "
-            "run create_engine_config to check whether VLLM_USE_V1 should be set."
-        )
-        EngineArgs.from_cli_args(copy.deepcopy(args)).create_engine_config()
-
-    if (
-        envs.is_set("VLLM_USE_V1")
-        and envs.VLLM_USE_V1
-        and args.kaito_kv_cache_cpu_memory_utilization > 0
-    ):
+    if args.kaito_kv_cache_cpu_memory_utilization > 0:
         os.environ["LMCACHE_CHUNK_SIZE"] = "256"
         os.environ["LMCACHE_LOCAL_CPU"] = "True"
         available_memory_gb = (
             psutil.virtual_memory().total - psutil.virtual_memory().used
         ) / (1024**3)
         logger.info(
-            f"VLLM_USE_V1 is set, Offload KV cache to CPU RAM, size limit: {available_memory_gb} * {args.kaito_kv_cache_cpu_memory_utilization} GB split among {args.tensor_parallel_size} GPUs"
+            f"Offload KV cache to CPU RAM, size limit: {available_memory_gb} * {args.kaito_kv_cache_cpu_memory_utilization} GB split among {args.tensor_parallel_size} GPUs"
         )
 
         # When using tensor parallelism, the KV cache CPU memory allocation must be divided evenly
@@ -366,7 +364,7 @@ def set_kv_cache_offloading_if_appliable(args: argparse.Namespace) -> None:
             }
     else:
         logger.info(
-            "VLLM_USE_V1 or kv_cache_cpu_memory_utilization is not set, do not use KV cache offload to CPU RAM."
+            "kv_cache_cpu_memory_utilization is not set, do not use KV cache offload to CPU RAM."
         )
 
 
@@ -398,4 +396,4 @@ if __name__ == "__main__":
     # - /v1/chat/completions
     # - /v1/completions
     # - /v1/embeddings
-    uvloop.run(api_server.run_server(args))
+    uvloop.run(run_server(args))
